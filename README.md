@@ -39,8 +39,8 @@ photobook gives your local photo collection the feel of a proper app: albums, ca
 
 ```
 your-photos/
-├── photos/          ← put your images and videos here or open the app and drag them onto the upload field
-└── index.html   ← open this
+├── photos/      ← put your images and videos here or open the app and drag them onto the upload field
+└── photobook-5-stable.html   ← open this
 └── appData/
     ├── styles.css
     ├── heic2any.js
