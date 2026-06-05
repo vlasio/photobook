@@ -48,7 +48,7 @@ your-photos/
 ```
 
 1. Create a folder anywhere on your drive
-2. Open `index.html` in Chrome or Edge
+2. Open `photobook-5-stable.html` in Chrome or Edge
 3. Click **Open Photobook Folder** and select your top-level folder
 4. photobook syncs your files and you're in
 
