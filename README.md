@@ -2,7 +2,7 @@
 
 > A private, offline-first photo and video organiser that runs entirely in your browser. Your files never leave your device.
 
-(screenshots/grid.png)
+(screenshots/grid.jpg)
 
 ---
 
