@@ -1,0 +1,1703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Family Photobook</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
+  <link rel="stylesheet" href="appData/styles.css">
+  <style id="enhancements">
+    /* --- Added: video, upload cancel, fullscreen projector mode --- */
+    .cell.video .vid-badge{
+      position:absolute; bottom:6px; right:6px;
+      min-width:22px; height:22px; padding:0 6px; border-radius:11px;
+      background:rgba(0,0,0,.62); color:#fff;
+      display:flex; align-items:center; justify-content:center;
+      font-size:11px; line-height:1; pointer-events:none; z-index:2;
+    }
+    .cell.video.no-thumb{ background:#1c1c1e; }
+    .cell.video.no-thumb::after{
+      content:'🎞'; position:absolute; inset:0;
+      display:flex; align-items:center; justify-content:center;
+      font-size:30px; opacity:.5;
+    }
+    .prog-box .cancel-up{
+      margin-top:16px; background:transparent;
+      border:1px solid var(--muted,#8a8a8a); color:var(--muted,#8a8a8a);
+      padding:8px 20px; border-radius:8px; cursor:pointer; font-size:13px;
+      transition:border-color .15s,color .15s;
+    }
+    .prog-box .cancel-up:hover{ border-color:var(--accent,#4a90d9); color:var(--accent,#4a90d9); }
+    .prog-box .cancel-up:disabled{ opacity:.5; cursor:default; }
+    .viewer-body{ position:relative; }
+    .viewer-body video{ max-width:100%; max-height:100%; object-fit:contain; background:#000; }
+    .viewer:fullscreen{ background:#000; }
+    #vfs{ font-size:13px; }
+    .v-unplayable{
+      position:absolute; inset:0; margin:auto;
+      display:flex; flex-direction:column; align-items:center; justify-content:center;
+      gap:10px; text-align:center; padding:24px; box-sizing:border-box;
+      background:rgba(0,0,0,.8); color:#fff; z-index:5;
+    }
+    .v-unplayable .vu-icon{ font-size:42px; opacity:.65; }
+    .v-unplayable .vu-title{ font-size:17px; font-weight:600; }
+    .v-unplayable .vu-msg{ font-size:13px; opacity:.82; max-width:360px; line-height:1.5; }
+    .v-unplayable .vu-btn{
+      margin-top:6px; background:var(--accent,#4a90d9); color:#fff; border:none;
+      padding:10px 20px; border-radius:8px; cursor:pointer; font-size:14px;
+    }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<script src="appData/heic2any.js"></script>
+<script src="appData/heic-decode.browser.js"></script>
+<script>
+'use strict';
+const DEFAULTS = ['Holidays', 'Home', 'Family'];
+const MAX_URL_CACHE = 150;
+const MAX_DIMENSION = 4096;
+const JPEG_QUALITY = 0.95;
+const MONTH_NAMES = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const GRID_SIZES = { small: 100, medium: 150, large: 220 };
+const SLIDESHOW_MIN_MS = 2000;
+const SLIDESHOW_MAX_MS = 20000;
+const SLIDESHOW_DEFAULT_MS = 5000;
+const VIRTUAL_UNSORTED = '__unsorted__';
+
+// Media type matchers
+const IMAGE_EXT = /\.(jpe?g|png|webp)$/i;
+const VIDEO_EXT = /\.(mp4|mov|m4v|webm)$/i;
+const HEIC_EXT = /\.(heic|heif)$/i;
+const MEDIA_EXT = /\.(jpe?g|png|webp|mp4|mov|m4v|webm)$/i;
+const THUMB_RE = /\.thumb\.jpg$/i;
+
+// Metadata file — dot-prefixed so it's hidden on macOS/Linux/most file managers.
+// (Not hidden on Windows Explorer — the FS Access API can't set OS hidden flags.)
+const META_FILE = '.photobook.json';
+const LEGACY_META_FILE = 'photobook.json';
+
+const App = {
+  // === STATE ===
+  dirHandle: null,
+  db: { photos: [], albums: [...DEFAULTS], settings: {} },
+  photos: [],            // filtered + sorted view
+  urlCache: new Map(),   // LRU: insertion order = recency
+  searchQuery: '',
+  activeAlbum: 'All',
+  sortOrder: 'desc',
+  observer: null,
+  pendingFiles: null,
+  selectMode: false,
+  selected: new Set(),
+  _saveQueue: Promise.resolve(),
+  _uploading: false,
+  _uploadCancelled: false,
+  _mounted: false,
+  _toastTimer: null,
+  _activeViewerClose: null, // For safety: track currently-mounted viewer's cleanup
+
+  // === HANDLE PERSISTENCE (IndexedDB) ===
+  _idb() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open('photobook_meta', 1);
+      r.onupgradeneeded = e => e.target.result.createObjectStore('handles');
+      r.onsuccess = e => res(e.target.result);
+      r.onerror = () => rej(r.error);
+    });
+  },
+  async _saveHandle(h) {
+    try {
+      const db = await this._idb();
+      await new Promise((res, rej) => {
+        const tx = db.transaction('handles', 'readwrite');
+        tx.objectStore('handles').put(h, 'dir');
+        tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+      });
+    } catch {}
+  },
+  async _loadHandle() {
+    try {
+      const db = await this._idb();
+      return await new Promise((res, rej) => {
+        const tx = db.transaction('handles', 'readonly');
+        const r = tx.objectStore('handles').get('dir');
+        r.onsuccess = () => res(r.result || null);
+        r.onerror = () => rej(r.error);
+      });
+    } catch { return null; }
+  },
+
+  // === ENTRY ===
+  async init() {
+    const hasAPI = typeof window.showDirectoryPicker === 'function';
+
+    // Defensive: close any lingering viewer if the page is hidden (covers reload race)
+    window.addEventListener('pagehide', () => {
+      if (this._activeViewerClose) try { this._activeViewerClose(); } catch {}
+    });
+
+    // Try to auto-open from a previously saved handle
+    if (hasAPI) {
+      const stored = await this._loadHandle();
+      if (stored) {
+        try {
+          const perm = await stored.queryPermission({ mode: 'readwrite' });
+          if (perm === 'granted') {
+            // Permission already held — open with no clicks at all
+            this.dirHandle = stored;
+            await this.dirHandle.getDirectoryHandle('photos', { create: true });
+            await this.loadDB();
+            const s = await this.sync();
+            this.refresh(s);
+            return;
+          }
+          // Permission needs re-confirming — show a single "Reopen" button
+          // (no folder picker, just a tap to re-grant)
+          this._showWelcome(hasAPI, stored);
+          return;
+        } catch {}
+      }
+    }
+
+    this._showWelcome(hasAPI, null);
+  },
+
+  _showWelcome(hasAPI, storedHandle) {
+    const hasStored = !!storedHandle;
+    document.getElementById('app').innerHTML = `
+      <div class="welcome"><div>
+        <div style="font-size:60px;margin-bottom:14px;">📖</div>
+        <h1>Family Photobook</h1>
+        <p>Your private photo collection.<br>Everything stays on this drive.</p>
+        ${hasStored
+          ? `<button class="btn" id="reopen-btn">📂 Open Photobook</button>
+             <p style="font-size:12px;color:var(--hint);margin-top:14px;margin-bottom:10px;">— or —</p>
+             <button class="btn" id="open-folder" style="background:transparent;color:var(--accent);font-size:13px;padding:8px 18px;">Choose a different folder</button>`
+          : `<button class="btn" id="open-folder" ${hasAPI ? '' : 'disabled'}>Open Photobook Folder</button>
+             <p style="font-size:12px;color:var(--hint);margin-top:14px;">Pick the appData folder on the ssd drive</p>`
+        }
+        ${hasAPI ? '' : '<p class="unsupported">This app requires the File System Access API.<br>Please use Chrome, Edge, or Opera.</p>'}
+      </div></div>`;
+
+    if (hasStored) {
+      document.getElementById('reopen-btn').onclick = async () => {
+        try {
+          await storedHandle.requestPermission({ mode: 'readwrite' });
+          this.dirHandle = storedHandle;
+          await this.dirHandle.getDirectoryHandle('photos', { create: true });
+          await this.loadDB();
+          const s = await this.sync();
+          this.refresh(s);
+        } catch (e) { if (e.name !== 'AbortError') alert('Could not reopen: ' + e.message); }
+      };
+    }
+    if (hasAPI && document.getElementById('open-folder')) {
+      document.getElementById('open-folder').onclick = () => this.openFolder();
+    }
+  },
+
+  async openFolder() {
+    try {
+      this.dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      await this._saveHandle(this.dirHandle);
+      await this.dirHandle.getDirectoryHandle('photos', { create: true });
+      await this.loadDB();
+      const s = await this.sync();
+      this.refresh(s);
+    } catch (e) { if (e.name !== 'AbortError') alert('Failed to open folder: ' + e.message); }
+  },
+
+  // === DB I/O ===
+  async loadDB() {
+    let loaded = false;
+    // Preferred: hidden dotfile
+    try {
+      const f = await (await this.dirHandle.getFileHandle(META_FILE)).getFile();
+      this.db = JSON.parse(await f.text());
+      loaded = true;
+    } catch {}
+
+    // Migrate legacy photobook.json -> .photobook.json (one time)
+    if (!loaded) {
+      try {
+        const f = await (await this.dirHandle.getFileHandle(LEGACY_META_FILE)).getFile();
+        this.db = JSON.parse(await f.text());
+        loaded = true;
+        await this.saveDB(); // writes the dotfile
+        try { await this.dirHandle.removeEntry(LEGACY_META_FILE); } catch {}
+      } catch {}
+    }
+
+    if (!loaded) {
+      this.db = { photos: [], albums: [...DEFAULTS], settings: {} };
+      await this.saveDB();
+    }
+
+    if (!this.db.photos) this.db.photos = [];
+    if (!this.db.albums) this.db.albums = [];
+    if (!this.db.settings) this.db.settings = {};
+
+    // Migration v2: remove old default General album
+    if (!this.db.migratedV2) {
+      this.db.albums = this.db.albums.filter(a => a !== 'General');
+      for (const p of this.db.photos) {
+        if (p.albums) p.albums = p.albums.filter(a => a !== 'General');
+      }
+      this.db.migratedV2 = true;
+      await this.saveDB();
+    }
+
+    for (const p of this.db.photos) {
+      if (!p.albums) p.albums = [];
+      if (!p.type) p.type = 'image';   // back-fill type for existing entries
+    }
+
+    // Settings defaults — validated
+    if (!this.db.settings.gridSize || !GRID_SIZES[this.db.settings.gridSize]) {
+      this.db.settings.gridSize = 'medium';
+    }
+    const ss = Number(this.db.settings.slideshowInterval);
+    if (!Number.isFinite(ss) || ss < SLIDESHOW_MIN_MS || ss > SLIDESHOW_MAX_MS) {
+      this.db.settings.slideshowInterval = SLIDESHOW_DEFAULT_MS;
+    }
+  },
+
+  // Queued writes prevent concurrent corruption
+  saveDB() {
+    this._saveQueue = this._saveQueue.then(async () => {
+      try {
+        const fh = await this.dirHandle.getFileHandle(META_FILE, { create: true });
+        const w = await fh.createWritable();
+        await w.write(JSON.stringify(this.db, null, 2));
+        await w.close();
+      } catch (e) { console.error('saveDB error:', e); }
+    });
+    return this._saveQueue;
+  },
+
+  async sync() {
+    const d = await this.dirHandle.getDirectoryHandle('photos');
+    const disk = new Set(); let added = 0, removed = 0;
+    for await (const [n, h] of d.entries()) {
+      if (h.kind !== 'file') continue;
+      if (n.startsWith('.')) continue;          // skip dotfiles
+      if (THUMB_RE.test(n)) continue;           // skip generated video thumbnails
+      const isImg = IMAGE_EXT.test(n), isVid = VIDEO_EXT.test(n);
+      if (!isImg && !isVid) continue;
+      disk.add('photos/' + n);
+      if (!this.db.photos.some(p => p.filename === 'photos/' + n)) {
+        const f = await h.getFile();
+        this.db.photos.push({
+          id: n.replace(/\.[^.]+$/, ''),
+          filename: 'photos/' + n,
+          type: isVid ? 'video' : 'image',
+          thumb: null,
+          date: new Date(f.lastModified).toISOString().slice(0, 10),
+          caption: '', albums: []
+        });
+        added++;
+      }
+    }
+    const b = this.db.photos.length;
+    this.db.photos = this.db.photos.filter(p => disk.has(p.filename));
+    removed = b - this.db.photos.length;
+    if (added || removed) { await this.saveDB(); return { added, removed }; }
+    return null;
+  },
+
+  // === HEIC CONVERSION ===
+async convertIfHEIC(file) {
+  const isHEIC = HEIC_EXT.test(file.name) || file.type === 'image/heic' || file.type === 'image/heif';
+  if (!isHEIC) return file;
+
+  const toJpeg = (blob) => new File([blob], file.name.replace(HEIC_EXT, '.jpg'), {
+    type: 'image/jpeg', lastModified: file.lastModified
+  });
+
+  // Pass 1: heic2any — fast, works for Samsung/non-Apple HEIC
+  try {
+    const result = await heic2any({ blob: file, toType: 'image/jpeg', quality: 1.0 });
+    return toJpeg(Array.isArray(result) ? result[0] : result);
+  } catch (e1) {
+    console.warn('heic2any failed (likely iPhone HDR gain map), trying heic-decode:', e1?.message);
+  }
+
+  // Pass 2: heic-decode (newer libheif WASM) — handles iPhone 15 HDR gain map HEICs
+  try {
+    const buf = await file.arrayBuffer();
+    // HeicDecode is the `one` function directly; .all handles multi-frame
+    const { data, width, height } = await HeicDecode({ buffer: buf });
+    const canvas = document.createElement('canvas');
+    canvas.width = width; canvas.height = height;
+    canvas.getContext('2d').putImageData(new ImageData(data, width, height), 0, 0);
+    const blob = await new Promise((res, rej) =>
+      canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob failed')), 'image/jpeg', JPEG_QUALITY)
+    );
+    return toJpeg(blob);
+  } catch (e2) {
+    console.warn('heic-decode failed:', e2?.message);
+  }
+
+  // Pass 3: createImageBitmap — last resort, works on Safari / macOS Chrome
+  try {
+    const bitmap = await createImageBitmap(file);
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width; canvas.height = bitmap.height;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0);
+    bitmap.close();
+    const blob = await new Promise((res, rej) =>
+      canvas.toBlob(b => b ? res(b) : rej(new Error('toBlob failed')), 'image/jpeg', JPEG_QUALITY)
+    );
+    return toJpeg(blob);
+  } catch (e3) {
+    console.warn('createImageBitmap failed:', e3?.message);
+  }
+
+  throw new Error(
+    `Can't convert ${file.name}. On iPhone: Share → Options → Most Compatible to export as JPEG.`
+  );
+},
+
+  // === IMAGE PROCESSING ===
+  compress(file) {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const timeout = setTimeout(() => { URL.revokeObjectURL(url); reject(new Error('Image load timed out')); }, 30000);
+      const img = new Image();
+      img.onload = () => {
+        clearTimeout(timeout);
+        let w = img.width, h = img.height;
+        if (w > MAX_DIMENSION || h > MAX_DIMENSION) {
+          if (w > h) { h = Math.round(h * MAX_DIMENSION / w); w = MAX_DIMENSION; }
+          else { w = Math.round(w * MAX_DIMENSION / h); h = MAX_DIMENSION; }
+        }
+        const c = document.createElement('canvas'); c.width = w; c.height = h;
+        c.getContext('2d').drawImage(img, 0, 0, w, h);
+        c.toBlob(b => { URL.revokeObjectURL(url); b ? resolve(b) : reject(new Error('toBlob failed')); }, 'image/jpeg', JPEG_QUALITY);
+      };
+      img.onerror = () => { clearTimeout(timeout); URL.revokeObjectURL(url); reject(new Error('Failed to load image: ' + file.name)); };
+      img.src = url;
+    });
+  },
+
+  // Grab a poster frame from a video for use as a grid thumbnail.
+  // Returns a JPEG Blob, or null if it can't be produced.
+  videoThumb(file) {
+    return new Promise(resolve => {
+      const url = URL.createObjectURL(file);
+      const v = document.createElement('video');
+      v.muted = true; v.playsInline = true; v.preload = 'metadata';
+      let done = false;
+      const finish = (blob) => {
+        if (done) return; done = true;
+        clearTimeout(to);
+        try { v.removeAttribute('src'); v.load(); } catch {}
+        URL.revokeObjectURL(url);
+        resolve(blob);
+      };
+      const to = setTimeout(() => finish(null), 30000);
+      v.onloadeddata = () => {
+        // seek slightly in so we don't grab a black first frame
+        try { v.currentTime = Math.min(1, (v.duration && isFinite(v.duration) ? v.duration : 2) / 2); }
+        catch { /* some browsers fire seeked off loadeddata anyway */ }
+      };
+      v.onseeked = () => {
+        try {
+          const w = v.videoWidth, h = v.videoHeight;
+          if (!w || !h) { finish(null); return; }
+          const scale = Math.min(1, 640 / Math.max(w, h));
+          const cw = Math.max(1, Math.round(w * scale)), ch = Math.max(1, Math.round(h * scale));
+          const c = document.createElement('canvas'); c.width = cw; c.height = ch;
+          c.getContext('2d').drawImage(v, 0, 0, cw, ch);
+          c.toBlob(b => finish(b), 'image/jpeg', 0.8);
+        } catch { finish(null); }
+      };
+      v.onerror = () => finish(null);
+      v.src = url;
+    });
+  },
+
+  async exifDate(file) {
+    try {
+      const buf = await file.slice(0, 128 * 1024).arrayBuffer(), dv = new DataView(buf);
+      if (dv.getUint16(0) !== 0xFFD8) return null;
+      let off = 2;
+      while (off < dv.byteLength - 4) {
+        const mk = dv.getUint16(off);
+        if (mk === 0xFFE1) {
+          const len = dv.getUint16(off + 2);
+          const segEnd = Math.min(off + 2 + len, dv.byteLength);
+          const chunk = new Uint8Array(buf, off, segEnd - off);
+          const txt = Array.from(chunk).map(b => b >= 32 && b < 127 ? String.fromCharCode(b) : ' ').join('');
+          const m = txt.match(/(\d{4}):(\d{2}):(\d{2})\s+\d{2}:\d{2}:\d{2}/) || txt.match(/(\d{4}):(\d{2}):(\d{2})/);
+          if (m) {
+            const y = +m[1], mo = +m[2], d = +m[3];
+            if (y >= 1900 && y <= 2100 && mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+              return `${m[1]}-${m[2]}-${m[3]}`;
+            }
+          }
+          off += 2 + len;
+        } else if ((mk & 0xFF00) === 0xFF00) { off += 2 + dv.getUint16(off + 2); } else break;
+      }
+    } catch {} return null;
+  },
+
+  fileSig(file) { return `${file.size}_${file.lastModified}_${file.name}`; },
+
+  // === URL CACHE (LRU) ===
+  // getURL caches the full media file under p.id.
+  // Video thumbnails are cached separately under `${p.id}:t` (see getURLByPath).
+  async getURL(p) { return this.getURLByPath(p.id, p.filename); },
+
+  async getURLByPath(key, filename) {
+    if (!filename) return '';
+    if (this.urlCache.has(key)) {
+      const url = this.urlCache.get(key);
+      this.urlCache.delete(key);
+      this.urlCache.set(key, url);
+      return url;
+    }
+    try {
+      let h = this.dirHandle;
+      for (const s of filename.split('/')) { h = s.includes('.') ? await h.getFileHandle(s) : await h.getDirectoryHandle(s); }
+      const url = URL.createObjectURL(await h.getFile());
+      this.urlCache.set(key, url);
+      while (this.urlCache.size > MAX_URL_CACHE) {
+        const oldestKey = this.urlCache.keys().next().value;
+        URL.revokeObjectURL(this.urlCache.get(oldestKey));
+        this.urlCache.delete(oldestKey);
+      }
+      return url;
+    } catch { return ''; }
+  },
+
+  revokeURL(id) {
+    for (const k of [id, id + ':t']) {
+      if (this.urlCache.has(k)) { URL.revokeObjectURL(this.urlCache.get(k)); this.urlCache.delete(k); }
+    }
+  },
+
+  // === UPLOAD ===
+  handleFiles(files) {
+    if (this._uploading) { this.toast('Upload already in progress'); return; }
+    const imgs = Array.from(files).filter(f =>
+      f.type.startsWith('image/') || f.type.startsWith('video/') ||
+      MEDIA_EXT.test(f.name) || HEIC_EXT.test(f.name)
+    );
+    if (!imgs.length) { this.toast('No supported photos or videos selected'); return; }
+
+    const existingSigs = new Set(this.db.photos.map(p => p.sig).filter(Boolean));
+    const unique = [], dupes = [];
+    for (const f of imgs) {
+      const sig = this.fileSig(f);
+      if (existingSigs.has(sig)) dupes.push(f);
+      else { unique.push(f); existingSigs.add(sig); }
+    }
+    if (!unique.length) { this.toast(`All ${dupes.length} already in library`); return; }
+    if (dupes.length) this.toast(`Skipping ${dupes.length} duplicate${dupes.length !== 1 ? 's' : ''}`);
+
+    this.pendingFiles = unique;
+    this.showAlbumPicker(unique);
+  },
+
+  showAlbumPicker(files) {
+    const sel = new Set();
+    const ov = document.createElement('div'); ov.className = 'modal-overlay';
+    const render = () => {
+      ov.innerHTML = `<div class="modal">
+        <h3>📸 ${files.length} item${files.length !== 1 ? 's' : ''} ready</h3>
+        <p class="sub">${this.db.albums.length ? 'Pick albums, or upload without (goes to Unsorted).' : 'Items will go to Unsorted. Create an album below if you like.'}</p>
+        ${this.db.albums.length ? `<label>Albums</label>
+        <div class="album-picks">
+          ${this.db.albums.map(a => `<div class="album-pick${sel.has(a) ? ' selected' : ''}" data-a="${this.esc(a)}">${this.esc(a)}</div>`).join('')}
+        </div>` : ''}
+        <div class="new-album-row">
+          <input type="text" id="nai" placeholder="New album name..." maxlength="40">
+          <button id="nab">+ Add</button>
+        </div>
+        <div class="modal-footer">
+          <button class="m-cancel" id="mc">Cancel</button>
+          <button class="m-go" id="mg">Upload</button>
+        </div>
+      </div>`;
+      ov.querySelectorAll('.album-pick[data-a]').forEach(e => {
+        e.onclick = () => { const a = e.dataset.a; sel.has(a) ? sel.delete(a) : sel.add(a); render(); };
+      });
+      ov.querySelector('#nab').onclick = async () => {
+        const v = ov.querySelector('#nai').value.trim();
+        if (!v) return;
+        if (this.db.albums.includes(v)) { this.toast('Album already exists'); return; }
+        this.db.albums.push(v); await this.saveDB(); sel.add(v); render();
+      };
+      ov.querySelector('#nai').onkeydown = e => { if (e.key === 'Enter') ov.querySelector('#nab').click(); };
+      ov.querySelector('#mc').onclick = () => { this.pendingFiles = null; ov.remove(); };
+      ov.querySelector('#mg').onclick = () => { ov.remove(); this.processUpload([...sel]); };
+    };
+    render(); document.body.appendChild(ov);
+  },
+
+  async processUpload(albums) {
+    const files = this.pendingFiles; this.pendingFiles = null;
+    if (!files || !files.length) return;
+    this._uploading = true;
+    this._uploadCancelled = false;
+
+    const ov = document.createElement('div'); ov.className = 'prog-overlay';
+    ov.innerHTML = `<div class="prog-box"><h3>Processing...</h3><div class="status" id="ps">0 / ${files.length}</div><div class="bar"><div class="fill" id="pf" style="width:0%"></div></div><button class="cancel-up" id="pcancel">Cancel</button></div>`;
+    document.body.appendChild(ov);
+    ov.querySelector('#pcancel').onclick = () => {
+      this._uploadCancelled = true;
+      const b = ov.querySelector('#pcancel');
+      if (b) { b.disabled = true; b.textContent = 'Finishing current item…'; }
+    };
+
+    const dir = await this.dirHandle.getDirectoryHandle('photos');
+    let n = 0, errors = 0;
+    for (const file of files) {
+      if (this._uploadCancelled) break;
+      try {
+        const isVideo = VIDEO_EXT.test(file.name) || (file.type && file.type.startsWith('video/'));
+        const isHEIC = HEIC_EXT.test(file.name) || file.type === 'image/heic' || file.type === 'image/heif';
+        const psEl = document.getElementById('ps');
+        if (psEl) {
+          if (isVideo) psEl.textContent = `Importing video ${n + errors + 1} / ${files.length}…`;
+          else if (isHEIC) psEl.textContent = `Converting ${n + errors + 1} / ${files.length}…`;
+        }
+        const sig = this.fileSig(file);
+        const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+        if (isVideo) {
+          // Store the video as-is (no re-encode), generate a poster thumbnail.
+          const extMatch = file.name.match(/\.[a-z0-9]+$/i);
+          const ext = (extMatch ? extMatch[0] : '.mp4').toLowerCase();
+          const fh = await dir.getFileHandle(id + ext, { create: true });
+          const w = await fh.createWritable(); await w.write(file); await w.close();
+
+          let thumb = null;
+          try {
+            const tb = await this.videoThumb(file);
+            if (tb) {
+              const th = await dir.getFileHandle(id + '.thumb.jpg', { create: true });
+              const tw = await th.createWritable(); await tw.write(tb); await tw.close();
+              thumb = 'photos/' + id + '.thumb.jpg';
+            }
+          } catch (e) { console.warn('thumb failed', e); }
+
+          const date = new Date(file.lastModified).toISOString().slice(0, 10);
+          this.db.photos.push({ id, filename: 'photos/' + id + ext, type: 'video', thumb, date, caption: '', albums, sig });
+          n++;
+        } else {
+          const converted = await this.convertIfHEIC(file);
+          const blob = await this.compress(converted);
+          const date = await this.exifDate(converted) || new Date(file.lastModified).toISOString().slice(0, 10);
+          const fh = await dir.getFileHandle(id + '.jpg', { create: true });
+          const w = await fh.createWritable(); await w.write(blob); await w.close();
+          this.db.photos.push({ id, filename: 'photos/' + id + '.jpg', type: 'image', thumb: null, date, caption: '', albums, sig });
+          n++;
+        }
+      } catch (e) { console.error('Upload failed:', file.name, e); errors++; }
+      const done = n + errors;
+      const psEl = document.getElementById('ps');
+      const pfEl = document.getElementById('pf');
+      if (psEl) psEl.textContent = `${done} / ${files.length}${errors ? ` (${errors} failed)` : ''}`;
+      if (pfEl) pfEl.style.width = `${(done / files.length) * 100}%`;
+    }
+    if (n > 0) await this.saveDB();
+    ov.remove();
+    this._uploading = false;
+    const cancelled = this._uploadCancelled;
+    this._uploadCancelled = false;
+
+    let msg;
+    if (cancelled) {
+      msg = `Upload cancelled — ${n} added`;
+    } else {
+      msg = `${n} item${n !== 1 ? 's' : ''} added`;
+      if (albums.length) msg += ' to ' + albums.join(', ');
+      else if (n > 0) msg += ' to Unsorted';
+    }
+    if (errors) msg += ` · ${errors} failed`;
+    this.toast(msg);
+    this.refresh();
+  },
+
+  // === DELETE / CONFIRM ===
+  confirm(msg, onYes) {
+    const ov = document.createElement('div'); ov.className = 'confirm-overlay';
+    ov.innerHTML = `<div class="confirm-box"><p>${msg}</p><div class="actions"><button class="cancel" id="cn">Cancel</button><button class="del" id="dy">Delete</button></div></div>`;
+    document.body.appendChild(ov);
+    const cancel = () => ov.remove();
+    ov.querySelector('#cn').onclick = cancel;
+    ov.querySelector('#dy').onclick = () => { ov.remove(); onYes(); };
+    ov.onclick = e => { if (e.target === ov) cancel(); };
+  },
+
+  // Remove a media file plus its thumbnail (if any) from disk.
+  async _removeFiles(dir, photo) {
+    try { await dir.removeEntry(photo.filename.split('/').pop()); } catch (e) { console.error(e); }
+    if (photo.thumb) { try { await dir.removeEntry(photo.thumb.split('/').pop()); } catch {} }
+  },
+
+  async deletePhoto(photo, cb) {
+    const label = photo.type === 'video' ? 'video' : 'photo';
+    this.confirm(`Delete this ${label}?<br><span style="font-size:13px;color:var(--muted)">This cannot be undone.</span>`, async () => {
+      try { const d = await this.dirHandle.getDirectoryHandle('photos'); await this._removeFiles(d, photo); } catch (e) { console.error(e); }
+      this.db.photos = this.db.photos.filter(p => p.id !== photo.id);
+      this.revokeURL(photo.id);
+      await this.saveDB(); this.toast(`${label[0].toUpperCase() + label.slice(1)} deleted`); if (cb) cb();
+    });
+  },
+
+  async deleteAlbum(name) {
+    this.confirm(`Delete album "${this.esc(name)}"?<br><span style="font-size:13px;color:var(--muted)">Photos won't be deleted, just untagged.</span>`, async () => {
+      this.db.albums = this.db.albums.filter(a => a !== name);
+      for (const p of this.db.photos) { p.albums = (p.albums || []).filter(a => a !== name); }
+      if (this.activeAlbum === name) this.activeAlbum = 'All';
+      await this.saveDB(); this.toast(`"${name}" deleted`); this.refresh();
+    });
+  },
+
+  async deleteSelected() {
+    const count = this.selected.size;
+    this.confirm(`Delete ${count} item${count !== 1 ? 's' : ''}?<br><span style="font-size:13px;color:var(--muted)">This cannot be undone.</span>`, async () => {
+      const dir = await this.dirHandle.getDirectoryHandle('photos');
+      for (const id of this.selected) {
+        const p = this.db.photos.find(x => x.id === id);
+        if (p) { await this._removeFiles(dir, p); this.revokeURL(id); }
+      }
+      this.db.photos = this.db.photos.filter(p => !this.selected.has(p.id));
+      await this.saveDB(); this.selected.clear(); this.selectMode = false;
+      this.toast(`${count} item${count !== 1 ? 's' : ''} deleted`); this.refresh();
+    });
+  },
+
+  // === ALBUM OPERATIONS ===
+  async createAlbum() {
+    const name = await this.promptInput('New album', 'Album name', '', 'Create');
+    if (!name) return;
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (this.db.albums.includes(trimmed)) { this.toast('Album already exists'); return; }
+    if (trimmed.length > 40) { this.toast('Name too long'); return; }
+    this.db.albums.push(trimmed);
+    await this.saveDB();
+    this.toast(`"${trimmed}" created`);
+    this.activeAlbum = trimmed;
+    this.refresh();
+  },
+
+  async renameAlbum(oldName) {
+    const name = await this.promptInput('Rename album', 'New name', oldName, 'Rename');
+    if (!name) return;
+    const trimmed = name.trim();
+    if (!trimmed || trimmed === oldName) return;
+    if (this.db.albums.includes(trimmed)) { this.toast('Album already exists'); return; }
+    if (trimmed.length > 40) { this.toast('Name too long'); return; }
+    const i = this.db.albums.indexOf(oldName);
+    if (i === -1) return;
+    this.db.albums[i] = trimmed;
+    for (const p of this.db.photos) {
+      const j = (p.albums || []).indexOf(oldName);
+      if (j !== -1) p.albums[j] = trimmed;
+    }
+    if (this.activeAlbum === oldName) this.activeAlbum = trimmed;
+    await this.saveDB();
+    this.toast(`Renamed to "${trimmed}"`);
+    this.refresh();
+  },
+
+  promptInput(title, placeholder, initial, btnLabel) {
+    return new Promise(resolve => {
+      const ov = document.createElement('div'); ov.className = 'modal-overlay';
+      ov.innerHTML = `<div class="modal">
+        <h3>${this.esc(title)}</h3>
+        <div class="new-album-row" style="margin-top:14px;">
+          <input type="text" id="pi" placeholder="${this.esc(placeholder)}" value="${this.esc(initial)}" maxlength="40" autocomplete="off">
+        </div>
+        <div class="modal-footer">
+          <button class="m-cancel" id="mc">Cancel</button>
+          <button class="m-go" id="mg">${this.esc(btnLabel)}</button>
+        </div>
+      </div>`;
+      document.body.appendChild(ov);
+      const input = ov.querySelector('#pi');
+      const finish = (val) => { ov.remove(); resolve(val); };
+      ov.querySelector('#mc').onclick = () => finish(null);
+      ov.querySelector('#mg').onclick = () => finish(input.value);
+      input.onkeydown = e => { if (e.key === 'Enter') finish(input.value); else if (e.key === 'Escape') finish(null); };
+      ov.onclick = e => { if (e.target === ov) finish(null); };
+      setTimeout(() => { input.focus(); input.select(); }, 50);
+    });
+  },
+
+  bulkAlbumAssign() {
+    const sel = new Set();
+    const ov = document.createElement('div'); ov.className = 'modal-overlay';
+    const render = () => {
+      ov.innerHTML = `<div class="modal">
+        <h3>Add ${this.selected.size} item${this.selected.size !== 1 ? 's' : ''} to albums</h3>
+        <p class="sub">Select albums to add to.</p>
+        <div class="album-picks">
+          ${this.db.albums.map(a =>
+            `<div class="album-pick${sel.has(a) ? ' selected' : ''}" data-a="${this.esc(a)}">${this.esc(a)}</div>`
+          ).join('') || '<p class="sub" style="margin:0">No albums yet — create one first.</p>'}
+        </div>
+        <div class="modal-footer">
+          <button class="m-cancel" id="mc">Cancel</button>
+          <button class="m-go" id="mg">Apply</button>
+        </div>
+      </div>`;
+      ov.querySelectorAll('.album-pick[data-a]').forEach(e => {
+        e.onclick = () => { const a = e.dataset.a; sel.has(a) ? sel.delete(a) : sel.add(a); render(); };
+      });
+      ov.querySelector('#mc').onclick = () => ov.remove();
+      ov.querySelector('#mg').onclick = async () => {
+        for (const id of this.selected) {
+          const p = this.db.photos.find(x => x.id === id);
+          if (p) { for (const a of sel) { if (!p.albums.includes(a)) p.albums.push(a); } }
+        }
+        await this.saveDB(); ov.remove();
+        this.toast(`${this.selected.size} item${this.selected.size !== 1 ? 's' : ''} tagged`);
+        this.selected.clear(); this.selectMode = false; this.refresh();
+      };
+    };
+    render(); document.body.appendChild(ov);
+  },
+
+  // === SETTINGS ===
+  showSettings() {
+    const intervalSec = Math.round((this.db.settings.slideshowInterval || SLIDESHOW_DEFAULT_MS) / 1000);
+    const ov = document.createElement('div'); ov.className = 'modal-overlay';
+    ov.innerHTML = `<div class="modal">
+      <h3>⚙ Settings</h3>
+      <p class="sub">Preferences are saved to your photobook folder.</p>
+
+      <label>Slideshow interval</label>
+      <div class="setting-row">
+        <input type="range" id="ss-int" min="${SLIDESHOW_MIN_MS / 1000}" max="${SLIDESHOW_MAX_MS / 1000}" step="1" value="${intervalSec}">
+        <span class="val" id="ss-int-val">${intervalSec}s</span>
+      </div>
+      <p class="hint-text">How long each photo stays on screen during a slideshow. Videos play in full, then advance.</p>
+
+      <div class="modal-footer">
+        <button class="m-cancel" id="mc">Cancel</button>
+        <button class="m-go" id="mg">Save</button>
+      </div>
+    </div>`;
+    document.body.appendChild(ov);
+    const slider = ov.querySelector('#ss-int');
+    const valEl = ov.querySelector('#ss-int-val');
+    const updateVal = () => { valEl.textContent = slider.value + 's'; };
+    slider.oninput = updateVal;
+    const cancel = () => ov.remove();
+    ov.querySelector('#mc').onclick = cancel;
+    ov.onclick = e => { if (e.target === ov) cancel(); };
+    ov.querySelector('#mg').onclick = async () => {
+      const sec = parseInt(slider.value, 10);
+      if (Number.isFinite(sec) && sec * 1000 >= SLIDESHOW_MIN_MS && sec * 1000 <= SLIDESHOW_MAX_MS) {
+        this.db.settings.slideshowInterval = sec * 1000;
+        await this.saveDB();
+        this.toast(`Slideshow set to ${sec}s`);
+      }
+      ov.remove();
+    };
+  },
+
+  // Launch slideshow from current filtered view
+  startSlideshow() {
+    if (!this.photos.length) { this.toast('No photos to show'); return; }
+    this.viewer(0, true);
+  },
+
+  // === EXPORT (native ZIP writer, no library) ===
+  _crc32Table: null,
+  crc32(data) {
+    if (!this._crc32Table) {
+      this._crc32Table = new Uint32Array(256);
+      for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let j = 0; j < 8; j++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+        this._crc32Table[i] = c;
+      }
+    }
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < data.length; i++) crc = this._crc32Table[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+    return (crc ^ 0xFFFFFFFF) >>> 0;
+  },
+
+  exportName(p, used) {
+    let base = p.date || 'undated';
+    if (p.caption) {
+      const safe = p.caption.replace(/[^a-zA-Z0-9-_ ]/g, '').trim().replace(/\s+/g, '_').slice(0, 50);
+      if (safe) base += '_' + safe;
+    } else {
+      base += '_' + p.id;
+    }
+    // Preserve the real extension so exported videos stay playable.
+    const extMatch = (p.filename || '').match(/\.[a-z0-9]+$/i);
+    const ext = extMatch ? extMatch[0].toLowerCase() : '.jpg';
+    let name = base + ext;
+    let n = 1;
+    while (used.has(name)) {
+      n++;
+      if (n > 9999) break;
+      name = base + '_' + n + ext;
+    }
+    used.add(name);
+    return name;
+  },
+
+  async exportSelected() {
+    if (!this.selected.size) return;
+    if (typeof window.showSaveFilePicker !== 'function') {
+      this.toast('Export needs Chrome, Edge, or Opera'); return;
+    }
+    const photos = [...this.selected].map(id => this.db.photos.find(p => p.id === id)).filter(Boolean);
+    if (!photos.length) return;
+
+    let fileHandle;
+    try {
+      fileHandle = await window.showSaveFilePicker({
+        suggestedName: `photobook-${new Date().toISOString().slice(0, 10)}.zip`,
+        types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }]
+      });
+    } catch (e) { return; }
+
+    const ov = document.createElement('div'); ov.className = 'prog-overlay';
+    ov.innerHTML = `<div class="prog-box"><h3>Exporting...</h3><div class="status" id="ps">0 / ${photos.length}</div><div class="bar"><div class="fill" id="pf" style="width:0%"></div></div></div>`;
+    document.body.appendChild(ov);
+
+    const writable = await fileHandle.createWritable();
+    const enc = new TextEncoder();
+    const central = [];
+    const usedNames = new Set();
+    let offset = 0, errors = 0;
+
+    try {
+      for (let n = 0; n < photos.length; n++) {
+        const p = photos[n];
+        try {
+          let h = this.dirHandle;
+          for (const s of p.filename.split('/')) {
+            h = s.includes('.') ? await h.getFileHandle(s) : await h.getDirectoryHandle(s);
+          }
+          const file = await h.getFile();
+          // ZIP (non-ZIP64) uses 32-bit sizes — files >= 4GB can't be stored. Skip them.
+          if (file.size > 0xFFFFFFFE) { console.warn('Skipping >4GB file', p.filename); errors++; continue; }
+          const data = new Uint8Array(await file.arrayBuffer());
+          const name = this.exportName(p, usedNames);
+          const nameBytes = enc.encode(name);
+          const crc = this.crc32(data);
+          const d = new Date(file.lastModified);
+          const dosTime = ((d.getHours() & 0x1F) << 11) | ((d.getMinutes() & 0x3F) << 5) | ((d.getSeconds() >> 1) & 0x1F);
+          const dosDate = (((d.getFullYear() - 1980) & 0x7F) << 9) | (((d.getMonth() + 1) & 0xF) << 5) | (d.getDate() & 0x1F);
+
+          const lfh = new Uint8Array(30 + nameBytes.length);
+          const dv = new DataView(lfh.buffer);
+          dv.setUint32(0, 0x04034b50, true);
+          dv.setUint16(4, 20, true);
+          dv.setUint16(6, 0, true);
+          dv.setUint16(8, 0, true);
+          dv.setUint16(10, dosTime, true);
+          dv.setUint16(12, dosDate, true);
+          dv.setUint32(14, crc, true);
+          dv.setUint32(18, data.length, true);
+          dv.setUint32(22, data.length, true);
+          dv.setUint16(26, nameBytes.length, true);
+          dv.setUint16(28, 0, true);
+          lfh.set(nameBytes, 30);
+
+          await writable.write(lfh);
+          await writable.write(data);
+
+          central.push({ nameBytes, crc, size: data.length, dosTime, dosDate, offset });
+          offset += lfh.length + data.length;
+        } catch (e) { console.error('Export failed for', p.filename, e); errors++; }
+
+        const done = n + 1;
+        const psEl = document.getElementById('ps');
+        const pfEl = document.getElementById('pf');
+        if (psEl) psEl.textContent = `${done} / ${photos.length}${errors ? ` (${errors} failed)` : ''}`;
+        if (pfEl) pfEl.style.width = `${(done / photos.length) * 100}%`;
+      }
+
+      const cdStart = offset;
+      for (const c of central) {
+        const cdh = new Uint8Array(46 + c.nameBytes.length);
+        const dv = new DataView(cdh.buffer);
+        dv.setUint32(0, 0x02014b50, true);
+        dv.setUint16(4, 20, true);
+        dv.setUint16(6, 20, true);
+        dv.setUint16(8, 0, true);
+        dv.setUint16(10, 0, true);
+        dv.setUint16(12, c.dosTime, true);
+        dv.setUint16(14, c.dosDate, true);
+        dv.setUint32(16, c.crc, true);
+        dv.setUint32(20, c.size, true);
+        dv.setUint32(24, c.size, true);
+        dv.setUint16(28, c.nameBytes.length, true);
+        dv.setUint32(42, c.offset, true);
+        cdh.set(c.nameBytes, 46);
+        await writable.write(cdh);
+        offset += cdh.length;
+      }
+      const cdSize = offset - cdStart;
+
+      const eocd = new Uint8Array(22);
+      const dv = new DataView(eocd.buffer);
+      dv.setUint32(0, 0x06054b50, true);
+      dv.setUint16(8, central.length, true);
+      dv.setUint16(10, central.length, true);
+      dv.setUint32(12, cdSize, true);
+      dv.setUint32(16, cdStart, true);
+      await writable.write(eocd);
+
+      await writable.close();
+      ov.remove();
+      this.toast(`Exported ${central.length} item${central.length !== 1 ? 's' : ''}${errors ? ` · ${errors} skipped/failed` : ''}`);
+    } catch (e) {
+      console.error('Export aborted:', e);
+      try { await writable.abort(); } catch {}
+      ov.remove();
+      this.toast('Export failed: ' + e.message);
+    }
+  },
+
+  // === FILTER / SORT ===
+  filterAndSort() {
+    let filtered = [...this.db.photos];
+    if (this.activeAlbum === VIRTUAL_UNSORTED) {
+      filtered = filtered.filter(p => !p.albums || p.albums.length === 0);
+    } else if (this.activeAlbum !== 'All') {
+      filtered = filtered.filter(p => p.albums && p.albums.includes(this.activeAlbum));
+    }
+    const q = this.searchQuery.toLowerCase().trim();
+    if (q) filtered = filtered.filter(p =>
+      (p.caption || '').toLowerCase().includes(q) ||
+      (p.date || '').includes(q) ||
+      (p.albums || []).some(a => a.toLowerCase().includes(q))
+    );
+    filtered.sort((a, b) => {
+      const cmp = (a.date || '').localeCompare(b.date || '');
+      return this.sortOrder === 'desc' ? -cmp : cmp;
+    });
+    this.photos = filtered;
+  },
+
+  // === RENDERING ===
+  refresh(syncResult) {
+    if (!this._mounted) { this.mount(); this._mounted = true; }
+    this.filterAndSort();
+    this.renderCount();
+    this.renderSortBtn();
+    this.renderGridBtn();
+    this.renderSelectBtn();
+    this.renderSlideshowBtn();
+    this.renderSyncNotice(syncResult);
+    this.renderUploadZone();
+    this.renderAlbums();
+    this.renderGrid();
+    this.applyGridSize();
+    this.renderFAB();
+  },
+
+renderGridBtn() {
+  const el = document.getElementById('grid-toggle');
+  if (!el) return;
+  const size = this.db.settings.gridSize || 'medium';
+  const labels = { small: 'Grid: S', medium: 'Grid: M', large: 'Grid: L' };
+  el.textContent = labels[size];
+},
+
+  renderSlideshowBtn() {
+    const el = document.getElementById('slideshow-btn');
+    if (!el) return;
+    el.disabled = this.photos.length === 0;
+    el.title = el.disabled ? 'No photos to show' : `Slideshow (${Math.round((this.db.settings.slideshowInterval || SLIDESHOW_DEFAULT_MS) / 1000)}s/photo)`;
+  },
+
+  applyGridSize() {
+    const size = this.db.settings.gridSize || 'medium';
+    const px = GRID_SIZES[size];
+    const grid = document.querySelector('.grid');
+    if (grid) grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${px}px, 1fr))`;
+  },
+
+  mount() {
+    document.getElementById('app').innerHTML = `
+      <div class="topbar">
+        <h1>📖 Photobook</h1>
+        <div class="search-box"><input type="text" id="search" placeholder="Search captions, dates, albums..." autocomplete="off"></div>
+        <div class="topbar-actions">
+          <button class="text-btn" id="slideshow-btn">Slideshow</button>
+          <button class="text-btn" id="grid-toggle">Grid</button>
+          <button class="text-btn" id="sort-toggle">Sort</button>
+          <button class="text-btn" id="sel-toggle">Select</button>
+          <button class="text-btn" id="settings-btn">Settings</button>
+          <span class="count" id="count"></span>
+        </div>
+      </div>
+      <div id="sync-notice"></div>
+      <div id="upload-zone-wrap"></div>
+      <div class="album-section">
+        <div class="album-section-head"><h2>Albums</h2></div>
+        <div class="album-tiles-wrap" id="album-tiles-wrap"><div class="album-tiles" id="album-tiles"></div></div>
+      </div>
+      <div class="grid-wrap" id="grid-wrap"></div>`;
+
+    const si = document.getElementById('search');
+    si.value = this.searchQuery;
+    let timer;
+    si.oninput = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        this.searchQuery = si.value;
+        this.filterAndSort();
+        this.renderCount();
+        this.renderSlideshowBtn();
+        this.renderGrid();
+      }, 200);
+    };
+
+    document.getElementById('grid-toggle').onclick = async () => {
+      const order = ['small', 'medium', 'large'];
+      const cur = this.db.settings.gridSize || 'medium';
+      this.db.settings.gridSize = order[(order.indexOf(cur) + 1) % order.length];
+      await this.saveDB();
+      this.renderGridBtn();
+      this.applyGridSize();
+    };
+
+    document.getElementById('sort-toggle').onclick = () => {
+      this.sortOrder = this.sortOrder === 'desc' ? 'asc' : 'desc';
+      this.renderSortBtn();
+      this.filterAndSort();
+      this.renderGrid();
+    };
+
+    document.getElementById('sel-toggle').onclick = () => {
+      this.selectMode = !this.selectMode;
+      this.selected.clear();
+      this.renderSelectBtn();
+      this.renderGrid();
+      this.renderFAB();
+    };
+
+    document.getElementById('slideshow-btn').onclick = () => this.startSlideshow();
+    document.getElementById('settings-btn').onclick = () => this.showSettings();
+
+    const strip = document.getElementById('album-tiles');
+    const wrap = document.getElementById('album-tiles-wrap');
+    const updateFade = () => {
+      const more = strip.scrollWidth > strip.clientWidth && strip.scrollLeft + strip.clientWidth < strip.scrollWidth - 4;
+      wrap.classList.toggle('has-more', more);
+    };
+    strip.onscroll = updateFade;
+    window.addEventListener('resize', updateFade);
+    this._updateFade = updateFade;
+  },
+
+  renderCount() {
+    const total = this.db.photos.length;
+    const showing = this.photos.length;
+    const text = (this.searchQuery.trim() || this.activeAlbum !== 'All') ? `${showing} of ${total}` : `${total} item${total !== 1 ? 's' : ''}`;
+    const el = document.getElementById('count');
+    if (el) el.textContent = text;
+  },
+
+renderSortBtn() {
+  const el = document.getElementById('sort-toggle');
+  if (el) el.textContent = this.sortOrder === 'desc' ? 'New ↓' : 'Old ↑';
+},
+
+  renderSelectBtn() {
+    const el = document.getElementById('sel-toggle');
+    if (el) el.classList.toggle('active', this.selectMode);
+  },
+
+  renderSyncNotice(syncResult) {
+    const el = document.getElementById('sync-notice');
+    if (!el) return;
+    if (!syncResult) { el.innerHTML = ''; return; }
+    const parts = [];
+    if (syncResult.added) parts.push(`${syncResult.added} found on drive`);
+    if (syncResult.removed) parts.push(`${syncResult.removed} cleaned up`);
+    el.innerHTML = `<div class="sync-notice">🔄 ${parts.join(', ')}</div>`;
+    setTimeout(() => { if (el) el.innerHTML = ''; }, 5000);
+  },
+
+  renderUploadZone() {
+    const wrap = document.getElementById('upload-zone-wrap');
+    if (!wrap) return;
+    const compact = this.db.photos.length > 0;
+    wrap.innerHTML = `
+      <div class="upload-zone${compact ? ' compact' : ''}" id="drop">
+        <div class="icon">📸</div>
+        <p>${compact ? 'Add more photos or videos' : 'Drop photos or videos here or tap to add'}</p>
+        <div class="hint">photos auto-compressed · videos kept as-is · JPG PNG WEBP HEIC MP4 MOV</div>
+        <input type="file" id="pk" multiple accept="image/*,video/*,.heic,.heif" hidden>
+      </div>`;
+    const drop = wrap.querySelector('#drop'), pk = wrap.querySelector('#pk');
+    drop.onclick = () => pk.click();
+    pk.onchange = e => { this.handleFiles(e.target.files); pk.value = ''; };
+    drop.ondragover = e => { e.preventDefault(); drop.classList.add('dragover'); };
+    drop.ondragleave = () => drop.classList.remove('dragover');
+    drop.ondrop = e => { e.preventDefault(); drop.classList.remove('dragover'); this.handleFiles(e.dataTransfer.files); };
+  },
+
+  renderAlbums() {
+    const el = document.getElementById('album-tiles');
+    if (!el) return;
+    const total = this.db.photos.length;
+    const allCover = total ? this.db.photos[total - 1] : null;
+    const unsortedCount = this.db.photos.filter(p => !p.albums || p.albums.length === 0).length;
+    const unsortedCover = (() => {
+      const list = this.db.photos.filter(p => !p.albums || p.albums.length === 0);
+      return list.length ? list[list.length - 1] : null;
+    })();
+    const ac = {}, coverPhotos = {};
+    for (const a of this.db.albums) {
+      const photos = this.db.photos.filter(p => p.albums && p.albums.includes(a));
+      ac[a] = photos.length;
+      coverPhotos[a] = photos.length ? photos[photos.length - 1] : null;
+    }
+    const coverImg = (p) => p ? `<img data-cover="${p.id}" alt="">` : null;
+
+    el.innerHTML = `
+     <div class="album-tile${this.activeAlbum === 'All' ? ' active' : ''}" data-album="All">
+        ${coverImg(allCover) || `<div class="no-cover">🏠</div>`}
+        <div class="album-label">All<span class="alb-count">${total}</span></div>
+      </div>
+      ${unsortedCount > 0 ? `<div class="album-tile${this.activeAlbum === VIRTUAL_UNSORTED ? ' active' : ''}" data-album="${VIRTUAL_UNSORTED}">
+        ${coverImg(unsortedCover) || `<div class="no-cover">📥</div>`}
+        <div class="album-label">Unsorted<span class="alb-count">${unsortedCount}</span></div>
+      </div>` : ''}
+      ${this.db.albums.map(a => `
+        <div class="album-tile${this.activeAlbum === a ? ' active' : ''}" data-album="${this.esc(a)}">
+          ${coverImg(coverPhotos[a]) || `<div class="no-cover">📁</div>`}
+          <div class="album-label">${this.esc(a)}<span class="alb-count">${ac[a] || 0}</span></div>
+          <div class="tile-actions">
+            <button class="tile-act-btn" data-rename-album="${this.esc(a)}" title="Rename">✎</button>
+            <button class="tile-act-btn del" data-del-album="${this.esc(a)}" title="Delete">✕</button>
+          </div>
+        </div>
+      `).join('')}
+      <div class="album-tile add-tile" id="add-album-tile">
+        <div class="no-cover">+</div>
+        <div class="album-label">New Album</div>
+      </div>`;
+
+    el.querySelectorAll('.album-tile[data-album]').forEach(t => {
+      t.onclick = e => {
+        if (e.target.closest('.tile-act-btn')) return;
+        this.activeAlbum = t.dataset.album;
+        this.filterAndSort();
+        this.renderCount();
+        this.renderSlideshowBtn();
+        this.renderAlbums();
+        this.renderGrid();
+      };
+    });
+    el.querySelectorAll('[data-del-album]').forEach(b => { b.onclick = e => { e.stopPropagation(); this.deleteAlbum(b.dataset.delAlbum); }; });
+    el.querySelectorAll('[data-rename-album]').forEach(b => { b.onclick = e => { e.stopPropagation(); this.renameAlbum(b.dataset.renameAlbum); }; });
+    document.getElementById('add-album-tile').onclick = () => this.createAlbum();
+
+    Promise.all(Array.from(el.querySelectorAll('img[data-cover]')).map(async img => {
+      const p = this.db.photos.find(x => x.id === img.dataset.cover);
+      if (!p) return;
+      // Video covers use their thumbnail (a video file can't render in <img>).
+      const u = p.type === 'video'
+        ? (p.thumb ? await this.getURLByPath(p.id + ':t', p.thumb) : '')
+        : await this.getURL(p);
+      if (u && img.isConnected) img.src = u;
+    }));
+
+    if (this._updateFade) this._updateFade();
+  },
+
+  renderGrid() {
+    const wrap = document.getElementById('grid-wrap');
+    if (!wrap) return;
+    wrap.classList.toggle('select-mode', this.selectMode);
+
+    if (!this.photos.length) {
+      const q = this.searchQuery.trim();
+      let msg;
+      if (q) msg = `No matches for "${this.esc(q)}"`;
+      else if (this.activeAlbum === VIRTUAL_UNSORTED) msg = 'Nothing unsorted — every item is in an album.';
+      else if (this.activeAlbum !== 'All') msg = `No items in ${this.esc(this.activeAlbum)}`;
+      else msg = 'No photos or videos yet.';
+      wrap.innerHTML = `<div class="empty"><div class="icon">${q ? '🔍' : '📷'}</div><p>${msg}</p></div>`;
+      return;
+    }
+
+    const groups = {};
+    for (const p of this.photos) { const k = p.date ? p.date.slice(0, 7) : '?'; (groups[k] = groups[k] || []).push(p); }
+    const fmt = k => k === '?' ? 'Unknown' : MONTH_NAMES[parseInt(k.split('-')[1])] + ' ' + k.split('-')[0];
+
+    let html = '<div class="grid">';
+    for (const [m, list] of Object.entries(groups)) {
+      html += `<div class="date-div" data-month="${m}"><span>${fmt(m)} · ${list.length}</span><span class="date-sel" data-month-sel="${m}">${this.selectMode ? 'Select all' : 'Select'}</span></div>`;
+      for (const p of list) {
+        const idx = this.photos.indexOf(p);
+        const isSel = this.selected.has(p.id);
+        const vid = p.type === 'video';
+        const cls = `cell${isSel ? ' selected' : ''}${vid ? ' video' : ''}${vid && !p.thumb ? ' no-thumb' : ''}`;
+        html += `<div class="${cls}" data-i="${idx}" data-id="${p.id}"><div class="sel-check">${isSel ? '✓' : ''}</div><img data-id="${p.id}" alt="">${vid ? '<div class="vid-badge">▶</div>' : ''}</div>`;
+      }
+    }
+    html += '</div>';
+    wrap.innerHTML = html;
+    this.applyGridSize();
+
+    wrap.querySelectorAll('.cell').forEach(c => {
+      c.onclick = () => {
+        if (this.selectMode) {
+          const id = c.dataset.id;
+          this.selected.has(id) ? this.selected.delete(id) : this.selected.add(id);
+          c.classList.toggle('selected', this.selected.has(id));
+          c.querySelector('.sel-check').textContent = this.selected.has(id) ? '✓' : '';
+          this.renderFAB();
+        } else {
+          this.viewer(+c.dataset.i);
+        }
+      };
+    });
+
+    wrap.querySelectorAll('[data-month-sel]').forEach(h => {
+      h.onclick = e => {
+        e.stopPropagation();
+        const month = h.dataset.monthSel;
+        const ids = this.photos.filter(p => (p.date ? p.date.slice(0, 7) : '?') === month).map(p => p.id);
+        const allSelected = ids.every(id => this.selected.has(id));
+        for (const id of ids) { if (allSelected) this.selected.delete(id); else this.selected.add(id); }
+        if (!this.selectMode) { this.selectMode = true; this.renderSelectBtn(); }
+        this.renderGrid();
+        this.renderFAB();
+      };
+    });
+
+    this.observeThumbs();
+  },
+
+  observeThumbs() {
+    if (this.observer) this.observer.disconnect();
+    this.observer = new IntersectionObserver(entries => {
+      for (const e of entries) {
+        if (!e.isIntersecting) continue;
+        const img = e.target, p = this.db.photos.find(x => x.id === img.dataset.id);
+        if (p) {
+          // Videos display their poster thumbnail (cached under `${id}:t`).
+          const pr = p.type === 'video'
+            ? (p.thumb ? this.getURLByPath(p.id + ':t', p.thumb) : Promise.resolve(''))
+            : this.getURL(p);
+          pr.then(u => {
+            if (u && img.isConnected) {
+              img.src = u;
+              img.onload = () => img.parentElement?.classList.add('loaded');
+              if (img.complete && img.naturalWidth) img.parentElement?.classList.add('loaded');
+            }
+          });
+        }
+        this.observer.unobserve(img);
+      }
+    }, { rootMargin: '300px' });
+    document.querySelectorAll('.grid img[data-id]').forEach(i => this.observer.observe(i));
+  },
+
+  renderFAB() {
+    document.querySelectorAll('.fab').forEach(f => f.remove());
+    if (!this.selectMode) return;
+    const fab = document.createElement('div'); fab.className = 'fab';
+    const allVisible = this.photos.length;
+    const allSelected = allVisible > 0 && this.photos.every(p => this.selected.has(p.id));
+    fab.innerHTML = `<span><span class="fab-count">${this.selected.size}</span> selected</span>
+      <button id="fab-all">${allSelected ? 'Deselect all' : 'Select all'}</button>
+      ${this.selected.size ? `<button id="fab-album">📁 Tag</button>
+      <button id="fab-delete" class="fab-danger">🗑 Delete</button>` : ''}
+      <button id="fab-clear" title="Exit select mode">✕</button>`;
+    document.body.appendChild(fab);
+    fab.querySelector('#fab-all').onclick = () => {
+      if (allSelected) this.selected.clear();
+      else for (const p of this.photos) this.selected.add(p.id);
+      this.renderGrid(); this.renderFAB();
+    };
+    if (this.selected.size) {
+      fab.querySelector('#fab-album').onclick = () => this.bulkAlbumAssign();
+      fab.querySelector('#fab-delete').onclick = () => this.deleteSelected();
+    }
+    fab.querySelector('#fab-clear').onclick = () => {
+      this.selectMode = false; this.selected.clear();
+      this.renderSelectBtn(); this.renderGrid(); this.renderFAB();
+    };
+  },
+
+  // === VIEWER ===
+  // Slideshow state is closure-local — NOT on the App singleton — so timers/handlers
+  // can never outlive the viewer instance.
+  async viewer(i, autoplay = false) {
+    // Safety: if a previous viewer is somehow still mounted, close it cleanly first
+    if (this._activeViewerClose) {
+      try { this._activeViewerClose(); } catch {}
+    }
+
+    const el = document.createElement('div');
+    el.className = 'viewer';
+    el.tabIndex = 0;
+
+    // === Closure-local state (per-viewer instance) ===
+    let currentPhoto = null;
+    let slideshowOn = false;
+    let slideTimer = null;            // setTimeout id (images)
+    let progressAnim = null;          // reserved for future rAF use
+    let closed = false;
+    let touchStartX = null, touchStartY = null;
+
+    const isSlideshowOn = () => slideshowOn;
+
+    const clearTimers = () => {
+      if (slideTimer !== null) { clearTimeout(slideTimer); slideTimer = null; }
+      if (progressAnim !== null) { cancelAnimationFrame(progressAnim); progressAnim = null; }
+    };
+
+    const resetProgress = () => {
+      const fill = el.querySelector('.ss-fill');
+      if (fill) { fill.style.transition = 'none'; fill.style.width = '0%'; }
+    };
+
+    const animateProgress = (duration) => {
+      const fill = el.querySelector('.ss-fill');
+      if (!fill) return;
+      fill.style.transition = 'none';
+      fill.style.width = '0%';
+      // Force reflow so the transition restarts
+      void fill.offsetWidth;
+      fill.style.transition = `width ${duration}ms linear`;
+      fill.style.width = '100%';
+    };
+
+    const updatePlayBtn = () => {
+      const btn = el.querySelector('#vplay');
+      if (!btn) return;
+      btn.textContent = slideshowOn ? '⏸' : '▶';
+      btn.title = slideshowOn ? 'Pause slideshow' : 'Start slideshow';
+      btn.classList.toggle('playing', slideshowOn);
+    };
+
+    // === Fullscreen ("projector mode") ===
+    const enterFullscreen = () => {
+      if (!document.fullscreenElement && el.requestFullscreen) {
+        el.requestFullscreen().catch(() => {});
+      }
+    };
+    const exitFullscreen = () => {
+      if (document.fullscreenElement && document.exitFullscreen) {
+        document.exitFullscreen().catch(() => {});
+      }
+    };
+    const toggleFullscreen = () => { document.fullscreenElement ? exitFullscreen() : enterFullscreen(); };
+    const onFsChange = () => {
+      const btn = el.querySelector('#vfs');
+      if (btn) btn.textContent = document.fullscreenElement ? '🗗' : '⛶';
+    };
+    document.addEventListener('fullscreenchange', onFsChange);
+
+    // Advance to the next item during slideshow
+    const advance = () => {
+      if (!slideshowOn || closed || !el.isConnected) { stopSlideshow(); return; }
+      flushCaption();
+      flushDate();
+      i = (i + 1) % this.photos.length;
+      show();
+    };
+
+    // Decide what triggers the *next* advance for the item now on screen:
+    //  - images: a timer of `slideshowInterval`
+    //  - videos: the video's own 'ended' event (wired in show())
+    const scheduleNext = () => {
+      clearTimers();
+      if (!slideshowOn || closed) return;
+      const p = this.photos[i];
+      if (p && p.type === 'video') {
+        resetProgress();   // video has no fixed duration bar; it plays to the end
+      } else {
+        const interval = this.db.settings.slideshowInterval || SLIDESHOW_DEFAULT_MS;
+        animateProgress(interval);
+        slideTimer = setTimeout(advance, interval);
+      }
+    };
+
+    const stopSlideshow = () => {
+      slideshowOn = false;
+      clearTimers();
+      el.classList.remove('slideshow-active');
+      updatePlayBtn();
+      resetProgress();
+    };
+
+    const startSlideshow = () => {
+      if (closed) return;
+      if (this.photos.length < 2) { this.toast('Need at least 2 items for a slideshow'); return; }
+      slideshowOn = true;
+      el.classList.add('slideshow-active');
+      enterFullscreen();
+      updatePlayBtn();
+      // Re-render the current item so videos pick up autoplay + ended handler,
+      // and images start their progress timer.
+      show();
+    };
+
+    const toggleSlideshow = () => { slideshowOn ? stopSlideshow() : startSlideshow(); };
+
+    // Always-safe caption/date flush — guarded against closed state
+    const flushCaption = () => {
+      if (closed) return;
+      const cap = el.querySelector('#vcap');
+      if (cap && currentPhoto && currentPhoto.caption !== cap.value) {
+        currentPhoto.caption = cap.value;
+        this.saveDB();
+      }
+    };
+
+    const flushDate = () => {
+      if (closed) return;
+      const di = el.querySelector('#vdate-input');
+      if (di && currentPhoto && di.value && currentPhoto.date !== di.value) {
+        currentPhoto.date = di.value;
+        this.saveDB();
+      }
+    };
+
+    const close = () => {
+      if (closed) return;
+      closed = true;
+      stopSlideshow();
+      exitFullscreen();
+      document.removeEventListener('fullscreenchange', onFsChange);
+      flushCaption();
+      flushDate();
+      if (this._activeViewerClose === close) this._activeViewerClose = null;
+      el.remove();
+      this.refresh();
+    };
+    this._activeViewerClose = close;
+
+    // Manual navigation — always pauses slideshow for consistency
+    const nav = (dir) => {
+      stopSlideshow();
+      const next = i + dir;
+      if (next < 0 || next >= this.photos.length) return;
+      flushCaption();
+      flushDate();
+      i = next;
+      show();
+    };
+
+    const show = async () => {
+      if (closed || !el.isConnected) return;
+      const p = this.photos[i];
+      currentPhoto = p;
+      if (!p) { close(); return; }
+      const isVideo = p.type === 'video';
+      const u = await this.getURL(p);
+      if (closed || !el.isConnected) return; // re-check after await
+
+      
+      const mediaHTML = isVideo
+        ? `<video id="vmedia" src="${u}" controls playsinline ${slideshowOn ? 'autoplay muted' : ''}></video>`
+        : `<img src="${u}" alt="">`;
+
+      el.innerHTML = `
+        <div class="ss-progress"><div class="ss-fill"></div></div>
+        <div class="viewer-bar">
+          <span style="opacity:0.6">${i + 1} / ${this.photos.length}</span>
+          <div class="bar-group">
+            <button id="vplay" title="Start slideshow">▶</button>
+            <button id="vfs" title="Fullscreen">⛶</button>
+            <button id="vd" class="danger" title="Delete">🗑</button>
+            <button id="vc" title="Close">✕</button>
+          </div>
+        </div>
+        <div class="viewer-body">
+          <button class="nav-btn prev" id="vp" ${i === 0 ? 'disabled' : ''}>‹</button>
+          ${mediaHTML}
+          <button class="nav-btn next" id="vn" ${i === this.photos.length - 1 ? 'disabled' : ''}>›</button>
+        </div>
+        <div class="viewer-bottom">
+          <div class="viewer-date"><input type="date" id="vdate-input" value="${this.esc(p.date || '')}" title="Edit date"></div>
+          <input class="caption-input" id="vcap" type="text" placeholder="Add a caption..." value="${this.esc(p.caption || '')}" maxlength="200">
+        </div>`;
+
+      el.querySelector('#vc').onclick = close;
+      el.querySelector('#vp').onclick = () => nav(-1);
+      el.querySelector('#vn').onclick = () => nav(1);
+      el.querySelector('#vplay').onclick = toggleSlideshow;
+      el.querySelector('#vfs').onclick = toggleFullscreen;
+      onFsChange();
+
+      el.querySelector('#vd').onclick = () => {
+        // Pause slideshow while confirming so dialog isn't fighting the timer
+        stopSlideshow();
+        this.deletePhoto(p, () => {
+          this.photos = this.photos.filter(x => x.id !== p.id);
+          if (!this.photos.length) { close(); return; }
+          if (i >= this.photos.length) i = this.photos.length - 1;
+          show();
+        });
+      };
+
+      
+      // Caption — pause slideshow on focus so the input doesn't disappear mid-keystroke
+      const cap = el.querySelector('#vcap');
+      cap.onfocus = () => stopSlideshow();
+      cap.onblur = () => { if (p.caption !== cap.value) { p.caption = cap.value; this.saveDB(); } };
+      cap.onkeydown = e => {
+        e.stopPropagation();
+        if (e.key === 'Enter') { e.preventDefault(); cap.blur(); }
+        else if (e.key === 'Escape') { e.preventDefault(); cap.blur(); }
+      };
+
+      const di = el.querySelector('#vdate-input');
+      di.onfocus = () => stopSlideshow();
+      di.onchange = () => { if (di.value && di.value !== p.date) { p.date = di.value; this.saveDB(); } };
+      di.onkeydown = e => e.stopPropagation();
+
+      // Wire video playback + handle clips the browser can't decode
+      // (most commonly iPhone HEVC .mov in Chrome/Edge).
+      if (isVideo) {
+        const vid = el.querySelector('#vmedia');
+        if (vid) {
+          let advanceQueued = false;
+          // Never let a stalled/unplayable/blocked video freeze a slideshow —
+          // fall back to the normal interval and move on.
+          const keepSlideshowMoving = () => {
+            if (!slideshowOn || advanceQueued) return;
+            advanceQueued = true;
+            clearTimers();
+            slideTimer = setTimeout(advance, this.db.settings.slideshowInterval || SLIDESHOW_DEFAULT_MS);
+          };
+
+          const showUnplayable = () => {
+            if (closed || !el.isConnected) return;
+            if (el.querySelector('.v-unplayable')) return; // don't stack
+            const box = document.createElement('div');
+            box.className = 'v-unplayable';
+            box.innerHTML = `
+              <div class="vu-icon">🎞</div>
+              <div class="vu-title">Can't play this video here</div>
+              <div class="vu-msg">It's most likely an iPhone (HEVC) clip your browser can't decode. The file itself is fine — Safari or a desktop player will open it.</div>
+              <button class="vu-btn" id="vu-save">⬇ Save / open in another app</button>`;
+            const body = el.querySelector('.viewer-body');
+            if (body) body.appendChild(box);
+            const saveBtn = box.querySelector('#vu-save');
+            if (saveBtn) saveBtn.onclick = (ev) => {
+              ev.stopPropagation();
+              stopSlideshow();              // they're dealing with this one — don't advance out from under them
+              this.downloadOriginal(p);
+            };
+            keepSlideshowMoving();           // in a slideshow, auto-skip past it
+          };
+
+          vid.onerror = showUnplayable;
+          // Belt-and-suspenders: some engines load "metadata" but report no dimensions.
+          vid.onloadedmetadata = () => { if (!vid.videoWidth && !vid.videoHeight) showUnplayable(); };
+
+          if (slideshowOn) {
+            vid.onended = () => { if (slideshowOn) advance(); };
+            const pr = vid.play();
+            if (pr && pr.catch) pr.catch(() => keepSlideshowMoving()); // autoplay blocked → keep moving
+          }
+        }
+      }
+
+      updatePlayBtn();
+      scheduleNext();
+    };
+
+    // Touch swipe — also pauses slideshow
+    el.addEventListener('touchstart', e => {
+      if (e.touches.length !== 1) { touchStartX = null; return; }
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+    }, { passive: true });
+    el.addEventListener('touchend', e => {
+      if (touchStartX === null) return;
+      const dx = e.changedTouches[0].clientX - touchStartX;
+      const dy = e.changedTouches[0].clientY - touchStartY;
+      touchStartX = null;
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'VIDEO') return;
+      if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+        nav(dx > 0 ? -1 : 1);
+      }
+    }, { passive: true });
+
+    document.body.appendChild(el);
+    await show();
+    el.focus();
+
+    // Keyboard nav
+    el.onkeydown = e => {
+      if (document.activeElement && (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'TEXTAREA')) return;
+      if (e.key === 'Escape') { e.preventDefault(); close(); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); nav(-1); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); nav(1); }
+      else if (e.key === ' ') { e.preventDefault(); toggleSlideshow(); }
+      else if (e.key === 'f' || e.key === 'F') { e.preventDefault(); toggleFullscreen(); }
+      else if (e.key === 'Delete' || e.key === 'Backspace') {
+        e.preventDefault();
+        stopSlideshow();
+        const p = this.photos[i]; if (p) this.deletePhoto(p, () => {
+          this.photos = this.photos.filter(x => x.id !== p.id);
+          if (!this.photos.length) { close(); return; }
+          if (i >= this.photos.length) i = this.photos.length - 1;
+          show();
+        });
+      }
+    };
+
+    // Auto-play if launched from topbar slideshow button
+    if (autoplay) startSlideshow();
+  },
+
+  // Save the original media file to disk (used as the fallback for videos
+  // the browser can't decode, e.g. iPhone HEVC in Chrome — the file is fine,
+  // it just needs a different player).
+  async downloadOriginal(p) {
+    try {
+      let h = this.dirHandle;
+      for (const s of p.filename.split('/')) { h = s.includes('.') ? await h.getFileHandle(s) : await h.getDirectoryHandle(s); }
+      const file = await h.getFile();
+      const ext = (p.filename.match(/\.[a-z0-9]+$/i) || ['.mp4'])[0].toLowerCase();
+      let base = p.date || 'video';
+      if (p.caption) {
+        const safe = p.caption.replace(/[^a-zA-Z0-9-_ ]/g, '').trim().replace(/\s+/g, '_').slice(0, 50);
+        if (safe) base += '_' + safe;
+      } else { base += '_' + p.id; }
+      const url = URL.createObjectURL(file);
+      const a = document.createElement('a');
+      a.href = url; a.download = base + ext;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      this.toast('Saved — open it with QuickTime, VLC, or Photos');
+    } catch (e) { this.toast('Could not save file: ' + e.message); }
+  },
+
+  // === UTILITIES ===
+  esc(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  },
+
+  toast(msg) {
+    document.querySelectorAll('.toast').forEach(t => t.remove());
+    if (this._toastTimer) { clearTimeout(this._toastTimer); this._toastTimer = null; }
+    const el = document.createElement('div'); el.className = 'toast'; el.textContent = msg;
+    document.body.appendChild(el);
+    this._toastTimer = setTimeout(() => { if (el.parentNode) el.remove(); this._toastTimer = null; }, 3000);
+  }
+};
+
+document.addEventListener('DOMContentLoaded', () => App.init().catch(console.error));
+</script>
+</body>
+</html>
